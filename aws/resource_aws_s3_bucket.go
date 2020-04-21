@@ -1233,25 +1233,6 @@ func resourceAwsS3BucketRead(d *schema.ResourceData, meta interface{}) error {
 		return fmt.Errorf("error setting lifecycle_rule: %s", err)
 	}
 
-	// Read the bucket replication configuration
-
-	replicationResponse, err := retryOnAwsCode(s3.ErrCodeNoSuchBucket, func() (interface{}, error) {
-		return s3conn.GetBucketReplication(&s3.GetBucketReplicationInput{
-			Bucket: aws.String(d.Id()),
-		})
-	})
-	if err != nil && !isAWSErr(err, "ReplicationConfigurationNotFoundError", "") {
-		return fmt.Errorf("error getting S3 Bucket replication: %s", err)
-	}
-
-	replicationConfiguration := make([]map[string]interface{}, 0)
-	if replication, ok := replicationResponse.(*s3.GetBucketReplicationOutput); ok {
-		replicationConfiguration = flattenAwsS3BucketReplicationConfiguration(replication.ReplicationConfiguration)
-	}
-	if err := d.Set("replication_configuration", replicationConfiguration); err != nil {
-		return fmt.Errorf("error setting replication_configuration: %s", err)
-	}
-
 	// Read the bucket server side encryption configuration
 
 	encryptionResponse, err := retryOnAwsCode(s3.ErrCodeNoSuchBucket, func() (interface{}, error) {
@@ -1329,19 +1310,6 @@ func resourceAwsS3BucketRead(d *schema.ResourceData, meta interface{}) error {
 		if err := d.Set("website_domain", websiteEndpoint.Domain); err != nil {
 			return err
 		}
-	}
-
-	// Retry due to S3 eventual consistency
-	tags, err := retryOnAwsCode(s3.ErrCodeNoSuchBucket, func() (interface{}, error) {
-		return keyvaluetags.S3BucketListTags(s3conn, d.Id())
-	})
-
-	if err != nil {
-		return fmt.Errorf("error listing tags for S3 Bucket (%s): %s", d.Id(), err)
-	}
-
-	if err := d.Set("tags", tags.(keyvaluetags.KeyValueTags).IgnoreAws().Map()); err != nil {
-		return fmt.Errorf("error setting tags: %s", err)
 	}
 
 	arn := arn.ARN{
