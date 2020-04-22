@@ -542,104 +542,6 @@ func resourceAwsS3Bucket() *schema.Resource {
 				},
 			},
 
-			"server_side_encryption_configuration": {
-				Type:     schema.TypeList,
-				MaxItems: 1,
-				Optional: true,
-				Elem: &schema.Resource{
-					Schema: map[string]*schema.Schema{
-						"rule": {
-							Type:     schema.TypeList,
-							MaxItems: 1,
-							Required: true,
-							Elem: &schema.Resource{
-								Schema: map[string]*schema.Schema{
-									"apply_server_side_encryption_by_default": {
-										Type:     schema.TypeList,
-										MaxItems: 1,
-										Required: true,
-										Elem: &schema.Resource{
-											Schema: map[string]*schema.Schema{
-												"kms_master_key_id": {
-													Type:     schema.TypeString,
-													Optional: true,
-												},
-												"sse_algorithm": {
-													Type:     schema.TypeString,
-													Required: true,
-													ValidateFunc: validation.StringInSlice([]string{
-														s3.ServerSideEncryptionAes256,
-														s3.ServerSideEncryptionAwsKms,
-													}, false),
-												},
-											},
-										},
-									},
-								},
-							},
-						},
-					},
-				},
-			},
-
-			"object_lock_configuration": {
-				Type:     schema.TypeList,
-				Optional: true,
-				MaxItems: 1,
-				Elem: &schema.Resource{
-					Schema: map[string]*schema.Schema{
-						"object_lock_enabled": {
-							Type:     schema.TypeString,
-							Required: true,
-							ForceNew: true,
-							ValidateFunc: validation.StringInSlice([]string{
-								s3.ObjectLockEnabledEnabled,
-							}, false),
-						},
-
-						"rule": {
-							Type:     schema.TypeList,
-							Optional: true,
-							MaxItems: 1,
-							Elem: &schema.Resource{
-								Schema: map[string]*schema.Schema{
-									"default_retention": {
-										Type:     schema.TypeList,
-										Required: true,
-										MinItems: 1,
-										MaxItems: 1,
-										Elem: &schema.Resource{
-											Schema: map[string]*schema.Schema{
-												"mode": {
-													Type:     schema.TypeString,
-													Required: true,
-													ValidateFunc: validation.StringInSlice([]string{
-														s3.ObjectLockRetentionModeGovernance,
-														s3.ObjectLockRetentionModeCompliance,
-													}, false),
-												},
-
-												"days": {
-													Type:         schema.TypeInt,
-													Optional:     true,
-													ValidateFunc: validation.IntAtLeast(1),
-												},
-
-												"years": {
-													Type:         schema.TypeInt,
-													Optional:     true,
-													ValidateFunc: validation.IntAtLeast(1),
-												},
-											},
-										},
-									},
-								},
-							},
-						},
-					},
-				},
-			},
-
 			"tags": tagsSchema(),
 		},
 	}
@@ -689,12 +591,6 @@ func resourceAwsS3BucketCreate(d *schema.ResourceData, meta interface{}) error {
 
 	if err := validateS3BucketName(bucket, awsRegion); err != nil {
 		return fmt.Errorf("Error validating S3 bucket name: %s", err)
-	}
-
-	// S3 Object Lock can only be enabled on bucket creation.
-	objectLockConfiguration := expandS3ObjectLockConfiguration(d.Get("object_lock_configuration").([]interface{}))
-	if objectLockConfiguration != nil && aws.StringValue(objectLockConfiguration.ObjectLockEnabled) == s3.ObjectLockEnabledEnabled {
-		req.ObjectLockEnabledForBucket = aws.Bool(true)
 	}
 
 	err := resource.Retry(5*time.Minute, func() *resource.RetryError {
@@ -802,18 +698,6 @@ func resourceAwsS3BucketUpdate(d *schema.ResourceData, meta interface{}) error {
 
 	if d.HasChange("replication_configuration") {
 		if err := resourceAwsS3BucketReplicationConfigurationUpdate(s3conn, d); err != nil {
-			return err
-		}
-	}
-
-	if d.HasChange("server_side_encryption_configuration") {
-		if err := resourceAwsS3BucketServerSideEncryptionConfigurationUpdate(s3conn, d); err != nil {
-			return err
-		}
-	}
-
-	if d.HasChange("object_lock_configuration") {
-		if err := resourceAwsS3BucketObjectLockConfigurationUpdate(s3conn, d); err != nil {
 			return err
 		}
 	}
@@ -1233,36 +1117,7 @@ func resourceAwsS3BucketRead(d *schema.ResourceData, meta interface{}) error {
 		return fmt.Errorf("error setting lifecycle_rule: %s", err)
 	}
 
-	// Read the bucket server side encryption configuration
-
-	encryptionResponse, err := retryOnAwsCode(s3.ErrCodeNoSuchBucket, func() (interface{}, error) {
-		return s3conn.GetBucketEncryption(&s3.GetBucketEncryptionInput{
-			Bucket: aws.String(d.Id()),
-		})
-	})
-	if err != nil && !isAWSErr(err, "ServerSideEncryptionConfigurationNotFoundError", "encryption configuration was not found") {
-		return fmt.Errorf("error getting S3 Bucket encryption: %s", err)
-	}
-
-	serverSideEncryptionConfiguration := make([]map[string]interface{}, 0)
-	if encryption, ok := encryptionResponse.(*s3.GetBucketEncryptionOutput); ok && encryption.ServerSideEncryptionConfiguration != nil {
-		serverSideEncryptionConfiguration = flattenAwsS3ServerSideEncryptionConfiguration(encryption.ServerSideEncryptionConfiguration)
-	}
-	if err := d.Set("server_side_encryption_configuration", serverSideEncryptionConfiguration); err != nil {
-		return fmt.Errorf("error setting server_side_encryption_configuration: %s", err)
-	}
-
-	// Object Lock configuration.
-	if conf, err := readS3ObjectLockConfiguration(s3conn, d.Id()); err != nil {
-		return fmt.Errorf("error getting S3 Bucket Object Lock configuration: %s", err)
-	} else {
-		if err := d.Set("object_lock_configuration", conf); err != nil {
-			return fmt.Errorf("error setting object_lock_configuration: %s", err)
-		}
-	}
-
 	// Add the region as an attribute
-
 	locationResponse, err := retryOnAwsCode(s3.ErrCodeNoSuchBucket, func() (interface{}, error) {
 		return s3conn.GetBucketLocation(
 			&s3.GetBucketLocationInput{
@@ -1345,13 +1200,7 @@ func resourceAwsS3BucketDelete(d *schema.ResourceData, meta interface{}) error {
 			log.Printf("[DEBUG] S3 Bucket attempting to forceDestroy %+v", err)
 
 			// Delete everything including locked objects.
-			// Don't ignore any object errors or we could recurse infinitely.
-			var objectLockEnabled bool
-			objectLockConfiguration := expandS3ObjectLockConfiguration(d.Get("object_lock_configuration").([]interface{}))
-			if objectLockConfiguration != nil {
-				objectLockEnabled = aws.StringValue(objectLockConfiguration.ObjectLockEnabled) == s3.ObjectLockEnabledEnabled
-			}
-			err = deleteAllS3ObjectVersions(s3conn, d.Id(), "", objectLockEnabled, false)
+			err = deleteAllS3ObjectVersions(s3conn, d.Id(), "", false, false)
 
 			if err != nil {
 				return fmt.Errorf("error S3 Bucket force_destroy: %s", err)
@@ -1876,80 +1725,6 @@ func resourceAwsS3BucketRequestPayerUpdate(s3conn *s3.S3, d *schema.ResourceData
 	return nil
 }
 
-func resourceAwsS3BucketServerSideEncryptionConfigurationUpdate(s3conn *s3.S3, d *schema.ResourceData) error {
-	bucket := d.Get("bucket").(string)
-	serverSideEncryptionConfiguration := d.Get("server_side_encryption_configuration").([]interface{})
-	if len(serverSideEncryptionConfiguration) == 0 {
-		log.Printf("[DEBUG] Delete server side encryption configuration: %#v", serverSideEncryptionConfiguration)
-		i := &s3.DeleteBucketEncryptionInput{
-			Bucket: aws.String(bucket),
-		}
-
-		_, err := s3conn.DeleteBucketEncryption(i)
-		if err != nil {
-			return fmt.Errorf("error removing S3 bucket server side encryption: %s", err)
-		}
-		return nil
-	}
-
-	c := serverSideEncryptionConfiguration[0].(map[string]interface{})
-
-	rc := &s3.ServerSideEncryptionConfiguration{}
-
-	rcRules := c["rule"].([]interface{})
-	var rules []*s3.ServerSideEncryptionRule
-	for _, v := range rcRules {
-		rr := v.(map[string]interface{})
-		rrDefault := rr["apply_server_side_encryption_by_default"].([]interface{})
-		sseAlgorithm := rrDefault[0].(map[string]interface{})["sse_algorithm"].(string)
-		kmsMasterKeyId := rrDefault[0].(map[string]interface{})["kms_master_key_id"].(string)
-		rcDefaultRule := &s3.ServerSideEncryptionByDefault{
-			SSEAlgorithm: aws.String(sseAlgorithm),
-		}
-		if kmsMasterKeyId != "" {
-			rcDefaultRule.KMSMasterKeyID = aws.String(kmsMasterKeyId)
-		}
-		rcRule := &s3.ServerSideEncryptionRule{
-			ApplyServerSideEncryptionByDefault: rcDefaultRule,
-		}
-
-		rules = append(rules, rcRule)
-	}
-
-	rc.Rules = rules
-	i := &s3.PutBucketEncryptionInput{
-		Bucket:                            aws.String(bucket),
-		ServerSideEncryptionConfiguration: rc,
-	}
-	log.Printf("[DEBUG] S3 put bucket replication configuration: %#v", i)
-
-	_, err := retryOnAwsCode(s3.ErrCodeNoSuchBucket, func() (interface{}, error) {
-		return s3conn.PutBucketEncryption(i)
-	})
-	if err != nil {
-		return fmt.Errorf("error putting S3 server side encryption configuration: %s", err)
-	}
-
-	return nil
-}
-
-func resourceAwsS3BucketObjectLockConfigurationUpdate(s3conn *s3.S3, d *schema.ResourceData) error {
-	// S3 Object Lock configuration cannot be deleted, only updated.
-	req := &s3.PutObjectLockConfigurationInput{
-		Bucket:                  aws.String(d.Get("bucket").(string)),
-		ObjectLockConfiguration: expandS3ObjectLockConfiguration(d.Get("object_lock_configuration").([]interface{})),
-	}
-
-	_, err := retryOnAwsCode(s3.ErrCodeNoSuchBucket, func() (interface{}, error) {
-		return s3conn.PutObjectLockConfiguration(req)
-	})
-	if err != nil {
-		return fmt.Errorf("error putting S3 object lock configuration: %s", err)
-	}
-
-	return nil
-}
-
 func resourceAwsS3BucketReplicationConfigurationUpdate(s3conn *s3.S3, d *schema.ResourceData) error {
 	bucket := d.Get("bucket").(string)
 	replicationConfiguration := d.Get("replication_configuration").([]interface{})
@@ -2248,25 +2023,6 @@ func resourceAwsS3BucketLifecycleUpdate(s3conn *s3.S3, d *schema.ResourceData) e
 	}
 
 	return nil
-}
-
-func flattenAwsS3ServerSideEncryptionConfiguration(c *s3.ServerSideEncryptionConfiguration) []map[string]interface{} {
-	var encryptionConfiguration []map[string]interface{}
-	rules := make([]interface{}, 0, len(c.Rules))
-	for _, v := range c.Rules {
-		if v.ApplyServerSideEncryptionByDefault != nil {
-			r := make(map[string]interface{})
-			d := make(map[string]interface{})
-			d["kms_master_key_id"] = aws.StringValue(v.ApplyServerSideEncryptionByDefault.KMSMasterKeyID)
-			d["sse_algorithm"] = aws.StringValue(v.ApplyServerSideEncryptionByDefault.SSEAlgorithm)
-			r["apply_server_side_encryption_by_default"] = []map[string]interface{}{d}
-			rules = append(rules, r)
-		}
-	}
-	encryptionConfiguration = append(encryptionConfiguration, map[string]interface{}{
-		"rule": rules,
-	})
-	return encryptionConfiguration
 }
 
 func flattenAwsS3BucketReplicationConfiguration(r *s3.ReplicationConfiguration) []map[string]interface{} {
@@ -2630,95 +2386,6 @@ func sourceSseKmsObjectsHash(v interface{}) int {
 
 type S3Website struct {
 	Endpoint, Domain string
-}
-
-//
-// S3 Object Lock functions.
-//
-
-func readS3ObjectLockConfiguration(conn *s3.S3, bucket string) ([]interface{}, error) {
-	resp, err := retryOnAwsCode(s3.ErrCodeNoSuchBucket, func() (interface{}, error) {
-		return conn.GetObjectLockConfiguration(&s3.GetObjectLockConfigurationInput{
-			Bucket: aws.String(bucket),
-		})
-	})
-	if err != nil {
-		// Certain S3 implementations do not include this API
-		if isAWSErr(err, "MethodNotAllowed", "") {
-			return nil, nil
-		}
-
-		if isAWSErr(err, "ObjectLockConfigurationNotFoundError", "") {
-			return nil, nil
-		}
-		return nil, err
-	}
-
-	return flattenS3ObjectLockConfiguration(resp.(*s3.GetObjectLockConfigurationOutput).ObjectLockConfiguration), nil
-}
-
-func expandS3ObjectLockConfiguration(vConf []interface{}) *s3.ObjectLockConfiguration {
-	if len(vConf) == 0 || vConf[0] == nil {
-		return nil
-	}
-
-	mConf := vConf[0].(map[string]interface{})
-
-	conf := &s3.ObjectLockConfiguration{}
-
-	if vObjectLockEnabled, ok := mConf["object_lock_enabled"].(string); ok && vObjectLockEnabled != "" {
-		conf.ObjectLockEnabled = aws.String(vObjectLockEnabled)
-	}
-
-	if vRule, ok := mConf["rule"].([]interface{}); ok && len(vRule) > 0 {
-		mRule := vRule[0].(map[string]interface{})
-
-		if vDefaultRetention, ok := mRule["default_retention"].([]interface{}); ok && len(vDefaultRetention) > 0 && vDefaultRetention[0] != nil {
-			mDefaultRetention := vDefaultRetention[0].(map[string]interface{})
-
-			conf.Rule = &s3.ObjectLockRule{
-				DefaultRetention: &s3.DefaultRetention{},
-			}
-
-			if vMode, ok := mDefaultRetention["mode"].(string); ok && vMode != "" {
-				conf.Rule.DefaultRetention.Mode = aws.String(vMode)
-			}
-			if vDays, ok := mDefaultRetention["days"].(int); ok && vDays > 0 {
-				conf.Rule.DefaultRetention.Days = aws.Int64(int64(vDays))
-			}
-			if vYears, ok := mDefaultRetention["years"].(int); ok && vYears > 0 {
-				conf.Rule.DefaultRetention.Years = aws.Int64(int64(vYears))
-			}
-		}
-	}
-
-	return conf
-}
-
-func flattenS3ObjectLockConfiguration(conf *s3.ObjectLockConfiguration) []interface{} {
-	if conf == nil {
-		return []interface{}{}
-	}
-
-	mConf := map[string]interface{}{
-		"object_lock_enabled": aws.StringValue(conf.ObjectLockEnabled),
-	}
-
-	if conf.Rule != nil && conf.Rule.DefaultRetention != nil {
-		mRule := map[string]interface{}{
-			"default_retention": []interface{}{
-				map[string]interface{}{
-					"mode":  aws.StringValue(conf.Rule.DefaultRetention.Mode),
-					"days":  int(aws.Int64Value(conf.Rule.DefaultRetention.Days)),
-					"years": int(aws.Int64Value(conf.Rule.DefaultRetention.Years)),
-				},
-			},
-		}
-
-		mConf["rule"] = []interface{}{mRule}
-	}
-
-	return []interface{}{mConf}
 }
 
 func flattenGrants(ap *s3.GetBucketAclOutput) []interface{} {
